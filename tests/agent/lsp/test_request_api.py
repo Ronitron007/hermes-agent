@@ -8,16 +8,18 @@ the server received and the text it answered on.
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 
 import pytest
 
 import agent.lsp
-from agent.lsp import LSPUnavailable
-from agent.lsp.client import file_uri
+from agent.lsp import LSPRequestError, LSPUnavailable
+from agent.lsp.client import LSPClient, file_uri
 from agent.lsp.manager import READ_ONLY_METHODS, LSPService
-from agent.lsp.protocol import LSPRequestError
-from tests.agent.lsp.test_service import _install_mock_server
+from agent.lsp.protocol import ERROR_CONTENT_MODIFIED
+from agent.lsp.servers import SERVERS, ServerDef, SpawnSpec
+from tests.agent.lsp.test_service import MOCK_SERVER, _install_mock_server
 
 _HOVER = {"position": {"line": 0, "character": 0}}
 
@@ -279,3 +281,69 @@ def test_a_server_a_plugin_uses_survives_the_idle_reaper(workspace):
     svc._loop.run(svc._reap_idle_once(), timeout=5.0)
 
     assert key in svc._clients
+
+
+def test_an_excluded_workspace_is_unavailable(workspace, tmp_path):
+    repo, svc, spawn_count = workspace(exclude_roots=[str(tmp_path / "repo")])
+
+    with pytest.raises(LSPUnavailable, match="exclude_roots"):
+        svc.request_sync(_source(repo), "textDocument/hover", _HOVER)
+    assert spawn_count["value"] == 0
+
+
+def test_params_that_are_not_a_dict_are_rejected(workspace):
+    repo, svc, spawn_count = workspace()
+
+    with pytest.raises(TypeError, match="params"):
+        svc.request_sync(_source(repo), "workspace/symbol", ["x"])
+    assert spawn_count["value"] == 0
+
+
+def test_a_slow_start_with_a_short_timeout_does_not_break_the_server(workspace):
+    """The server initializes in 3.5s; the agent's edit check tolerates that, so a plugin call with a
+    0.5s timeout must too, or it turns the agent's own diagnostics off for the process lifetime."""
+    repo, svc, _ = workspace(wait_timeout=0.5)
+    index = next(i for i, s in enumerate(SERVERS) if s.server_id == "pyright")
+    original = SERVERS[index]
+    code = (f"import runpy, sys, time; time.sleep(3.5); sys.argv = [{MOCK_SERVER!r}]; "
+            f"runpy.run_path({MOCK_SERVER!r}, run_name='__main__')")
+    # Replaces the fixture's mock entry; the fixture's teardown restores the real server.
+    SERVERS[index] = ServerDef(
+        server_id="pyright", extensions=original.extensions, resolve_root=lambda fp, ws: ws,
+        build_spawn=lambda root, ctx: SpawnSpec(command=[sys.executable, "-c", code], workspace_root=root,
+                                                cwd=root, env={"MOCK_LSP_SCRIPT": "query"},
+                                                initialization_options={}),
+        seed_first_push=False, description="slow-starting mock pyright")
+    path = _source(repo)
+
+    assert svc.request_sync(path, "textDocument/hover", _HOVER, timeout=0.5)["text"] == "x = 1\n"
+    assert svc.get_status()["broken"] == []
+    assert svc.enabled_for(path)
+
+
+def test_content_modified_retries_stay_inside_the_timeout(workspace, monkeypatch):
+    """A busy server answering ContentModified: the retries must end within the request's own timeout
+    (slow, not broken), never run into the outer limit that marks the server broken."""
+    repo, svc, _ = workspace(wait_timeout=1.0)
+    path = _source(repo)
+    svc.request_sync(path, "textDocument/hover", _HOVER)
+    real = LSPClient._send_request
+
+    async def busy(self, method, params):
+        if method == "textDocument/hover":
+            # health: allow HX013 -- the delay IS the behaviour under test (a busy server answering late)
+            await asyncio.sleep(0.9)
+            raise LSPRequestError(ERROR_CONTENT_MODIFIED, "content modified")
+        return await real(self, method, params)
+
+    monkeypatch.setattr(LSPClient, "_send_request", busy)
+    with pytest.raises(LSPUnavailable, match="did not answer"):
+        svc.request_sync(path, "textDocument/hover", _HOVER)
+    assert svc.get_status()["broken"] == []
+
+
+def test_lsp_request_error_is_public():
+    from agent.lsp.protocol import LSPRequestError as defined
+
+    assert LSPRequestError is defined
+    assert "LSPRequestError" in agent.lsp.__all__

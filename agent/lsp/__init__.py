@@ -15,6 +15,7 @@ import threading
 from typing import Any, Optional
 
 from agent.lsp.manager import LSPService, LSPUnavailable, require_read_only
+from agent.lsp.protocol import LSPRequestError
 
 logger = logging.getLogger("agent.lsp")
 
@@ -68,8 +69,9 @@ def get_service() -> Optional[LSPService]:
 def request(file_path: str, method: str, params: Optional[dict[str, Any]] = None,
             *, timeout: Optional[float] = None) -> Any:
     """Send the read-only LSP request ``method`` for ``file_path`` to the active profile's server and
-    return its raw result; ``None`` = the server has no answer.  Blocks up to ``timeout`` (default
-    ``lsp.wait_timeout``).  See :meth:`LSPService.request_sync` for the params and errors."""
+    return its raw result; ``None`` = the server has no answer.  Blocks about ``timeout`` (default
+    ``lsp.wait_timeout``) for the answer; a call that must first start the server also waits for that.
+    See :meth:`LSPService.request_sync` for the params and errors."""
     require_read_only(method)
     if (svc := get_service()) is None:
         raise LSPUnavailable("LSP is disabled (lsp.enabled is false in config.yaml, or the config did not load)")
@@ -113,4 +115,4 @@ def _atexit_shutdown() -> None:
         logger.debug("atexit LSP shutdown failed: %s", e)
 
 
-__all__ = ["LSPService", "LSPUnavailable", "get_service", "release_workspace", "request", "shutdown_service"]
+__all__ = ["LSPRequestError", "LSPService", "LSPUnavailable", "get_service", "release_workspace", "request", "shutdown_service"]

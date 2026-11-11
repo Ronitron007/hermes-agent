@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
 from agent.lsp.client import DIAGNOSTICS_DOCUMENT_WAIT, LSPClient, _diagnostic_key as _diag_key, file_uri
-from agent.lsp.edit_check import EditChecks
+from agent.lsp.edit_check import _SPAWN_CEILING, EditChecks
 from agent.lsp.protocol import LSPProtocolError
 from agent.lsp.servers import (
     SERVERS, UNTRUSTED_SAFE_SERVERS, ServerContext, ServerDef, custom_servers, find_server_for_file, language_id_for,
@@ -468,27 +468,30 @@ class LSPService:
         without ``params["textDocument"]`` gets this file's.  ``None`` = the server has no answer.
         Raises :class:`LSPUnavailable` when no server can answer (the gates of :meth:`enabled_for`,
         a failed spawn, no answer within ``timeout``, default ``lsp.wait_timeout``) and
-        ``LSPRequestError`` when the server answers with an error.  A connection failure marks the
-        server broken, as :meth:`get_diagnostics_sync` does.  An unreadable file raises ``OSError``.
+        ``LSPRequestError`` when the server answers with an error.  The answer wait is ``timeout``;
+        a call that must first start the server also waits for that, as the edit check does.  Only a
+        connection failure or a server that never starts marks it broken, as
+        :meth:`get_diagnostics_sync` does.  An unreadable file raises ``OSError``.
         """
         require_read_only(method)
+        if params is not None and not isinstance(params, dict):
+            raise TypeError(f"params must be a dict of LSP request params, got {type(params).__name__}")
         if timeout is not None and not timeout > 0:
             raise ValueError(f"timeout must be a positive number of seconds, got {timeout!r}")
         if (reason := self._unavailable_reason(file_path)) is not None:
             raise LSPUnavailable(reason)
         abs_path = os.path.abspath(file_path)
-        text = Path(abs_path).read_text(encoding="utf-8-sig", errors="replace")
         params = dict(params or {})
         if method.startswith("textDocument/") and "textDocument" not in params:
             params["textDocument"] = {"uri": file_uri(abs_path)}
         server_id = self._server_for(abs_path).server_id  # the gates guarantee a match
         default = self._wait_budget(abs_path)
         budget = timeout if timeout is not None else default
-        # A ceiling only: it adds the spawn/warm-up allowance diagnostics get, so a short ``timeout``
-        # on a cold root cannot mark a slow-starting server broken.
-        ceiling = budget + default + 2.0
+        # A ceiling only, never below the edit check's (``2 * budget + _SPAWN_CEILING``): a plugin call
+        # must not mark broken a slow-starting server the agent's own edit check would wait for.
+        ceiling = max(budget, default) + default + _SPAWN_CEILING
         try:
-            return self._loop.run(self._request_async(abs_path, text, method, params, budget), timeout=ceiling)
+            return self._loop.run(self._request_async(abs_path, method, params, budget), timeout=ceiling)
         except TimeoutError as e:
             eventlog.log_timeout(server_id, abs_path, kind=method)
             self._mark_broken_for_file(abs_path, e)
@@ -498,11 +501,14 @@ class LSPService:
             self._mark_broken_for_file(abs_path, e)
             raise LSPUnavailable(f"the {server_id} server failed: {e}") from e
 
-    async def _request_async(self, abs_path: str, text: str, method: str, params: dict[str, Any],
-                             budget: float) -> Any:
+    async def _request_async(self, abs_path: str, method: str, params: dict[str, Any], budget: float) -> Any:
         if (client := await self._get_or_spawn(abs_path)) is None:
             raise LSPUnavailable(f"the {self._server_for(abs_path).server_id} server could not start for "
                                  f"{abs_path} (see `hermes lsp status`)")
+        # Read on the loop with no await before the sync decision: an edit check that finished in
+        # between has already left the server holding newer bytes than an earlier read would.
+        # health: allow ASYNC240 -- a to_thread read would yield before the sync decision; open_file reads the same way
+        text = Path(abs_path).read_text(encoding="utf-8-sig", errors="replace")
         synced = client.document_text(abs_path)
         # An edit check diagnoses its own snapshots of the file; a re-sync now would answer its wait
         # with the verdict on this text.  It leaves the server holding the newest content when done.
@@ -511,7 +517,9 @@ class LSPService:
             if synced is None or (synced != text and not checking):
                 await client.open_file(abs_path, language_id=language_id_for(abs_path, self._server_for(abs_path)),
                                        text=text)
-            return await client._send_request_with_retry(method, params, timeout=budget)
+            # One deadline for every ContentModified retry, so this fires before the outer ceiling.
+            return await asyncio.wait_for(client._send_request_with_retry(method, params, timeout=budget),
+                                          timeout=budget)
         except TimeoutError as e:
             # Alive but slow (a cold project still indexing): not marked broken.
             raise LSPUnavailable(f"the {client.server_id} server did not answer {method} within {budget:g}s "

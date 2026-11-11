@@ -1264,22 +1264,25 @@ and returns the server's raw result. These names are public and covered by the c
 
 | Import | What it gives you |
 |---|---|
-| `agent.lsp.request` | Opens `file_path` on its server, sends `method`, returns the raw LSP result. `None` means the server has no answer. A `textDocument/` request without `params["textDocument"]` gets the file's URI. Blocks up to `timeout` seconds (default `lsp.wait_timeout`). |
+| `agent.lsp.request` | Opens `file_path` on its server, sends `method`, returns the raw LSP result. `None` means the server has no answer. A `textDocument/` request without `params["textDocument"]` gets the file's URI. Waits about `timeout` seconds (default `lsp.wait_timeout`) for the answer. The first call for a workspace also waits for the server to start. |
 | `agent.lsp.LSPUnavailable` | Raised when no server can answer for the file. Its `reason` says why: LSP is disabled, no server handles the file, the file is not in a git workspace, the workspace is not trusted or excluded, the server is broken, or the server did not answer in time. |
+| `agent.lsp.LSPRequestError` | Raised when the server answers with an error response. It carries the LSP `code`, `message` and `data`. |
 
 `method` is one of `textDocument/hover`, `definition`, `declaration`, `typeDefinition`,
 `implementation`, `references`, `documentSymbol`, `documentHighlight`, or `workspace/symbol`. Any
-other method raises `ValueError` before a server starts. An error response from the server raises
-the client's `LSPRequestError`. Positions are 0-based, in UTF-16 code units, as LSP defines them.
+other method raises `ValueError` before a server starts. `params` must be a dict. Positions are
+0-based, in UTF-16 code units, as LSP defines them.
 
 ```python
-from agent.lsp import LSPUnavailable, request
+from agent.lsp import LSPRequestError, LSPUnavailable, request
 
 def hover_text(path, line, character):
     try:
         result = request(path, "textDocument/hover", {"position": {"line": line, "character": character}})
     except LSPUnavailable as e:
         return f"no language server: {e.reason}"
+    except LSPRequestError as e:
+        return f"the server rejected the request: {e.message}"
     if result is None:
         return "nothing to show"
     contents = result["contents"]

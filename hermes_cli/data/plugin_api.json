@@ -141,7 +141,8 @@
       "source": "plugins/index.md § Query a language server",
       "entries": [
         "agent.lsp:request",
-        "agent.lsp:LSPUnavailable"
+        "agent.lsp:LSPUnavailable",
+        "agent.lsp:LSPRequestError"
       ]
     },
     {
