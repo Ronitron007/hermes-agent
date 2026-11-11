@@ -1255,6 +1255,39 @@ def open_skill(name):
 Plugin-registered skills (`ctx.register_skill`) are not on disk under these roots; `find_all_skills()`
 returns the on-disk catalog only.
 
+### Query a language server
+
+A plugin that needs code intelligence (hover text, a definition, the references to a symbol) can ask
+the language server Hermes already runs for the file (see [LSP](../../user-guide/features/lsp.md)).
+`agent.lsp.request(file_path, method, params=None, *, timeout=None)` sends one read-only LSP request
+and returns the server's raw result. These names are public and covered by the compatibility contract:
+
+| Import | What it gives you |
+|---|---|
+| `agent.lsp.request` | Opens `file_path` on its server, sends `method`, returns the raw LSP result. `None` means the server has no answer. A `textDocument/` request without `params["textDocument"]` gets the file's URI. Blocks up to `timeout` seconds (default `lsp.wait_timeout`). |
+| `agent.lsp.LSPUnavailable` | Raised when no server can answer for the file. Its `reason` says why: LSP is disabled, no server handles the file, the file is not in a git workspace, the workspace is not trusted or excluded, the server is broken, or the server did not answer in time. |
+
+`method` is one of `textDocument/hover`, `definition`, `declaration`, `typeDefinition`,
+`implementation`, `references`, `documentSymbol`, `documentHighlight`, or `workspace/symbol`. Any
+other method raises `ValueError` before a server starts. An error response from the server raises
+the client's `LSPRequestError`. Positions are 0-based, in UTF-16 code units, as LSP defines them.
+
+```python
+from agent.lsp import LSPUnavailable, request
+
+def hover_text(path, line, character):
+    try:
+        result = request(path, "textDocument/hover", {"position": {"line": line, "character": character}})
+    except LSPUnavailable as e:
+        return f"no language server: {e.reason}"
+    if result is None:
+        return "nothing to show"
+    contents = result["contents"]
+    return contents.get("value", "") if isinstance(contents, dict) else str(contents)
+```
+
+The call blocks the calling thread. From async code, run it with `asyncio.to_thread`.
+
 ### Ship a language pack
 
 A plugin can add a UI language or override the wording of an existing one for every surface at once —

@@ -118,6 +118,8 @@ with a name allows that one name only.
 | `tools.skills_tool` | `skill_lookup_path_error` | plugins/index.md § Read the skill catalog |
 | `tools.skills_sync` | `dir_hash` | plugins/index.md § Read the skill catalog |
 | `tools.skill_usage` | `read_skill_name` | plugins/index.md § Read the skill catalog |
+| `agent.lsp` | `request` | plugins/index.md § Query a language server |
+| `agent.lsp` | `LSPUnavailable` | plugins/index.md § Query a language server |
 | `gateway.session_context` | `get_session_env` | plugins/index.md § platform plugins: read session identity through the task-local context |
 | `agent.redact` | `redact_sensitive_text` | plugin-llm-access.md § From the plugin's frontend: a plugin RPC method (`force=True` where secrets must never leave) |
 | `hermes_cli.plugin_session` | `session_client` | user-guide/features/plugins.md § Plugin code inside the gateway: which client created the session |

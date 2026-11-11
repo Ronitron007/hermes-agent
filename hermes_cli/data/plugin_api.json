@@ -138,6 +138,13 @@
       ]
     },
     {
+      "source": "plugins/index.md § Query a language server",
+      "entries": [
+        "agent.lsp:request",
+        "agent.lsp:LSPUnavailable"
+      ]
+    },
+    {
       "source": "plugins/index.md § platform plugins: read session identity through the task-local context",
       "entries": [
         "gateway.session_context:get_session_env"

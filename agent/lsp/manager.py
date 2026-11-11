@@ -7,7 +7,8 @@ client per ``server_id`` and further roots (typically sibling git worktrees) are
 process via ``workspace/didChangeWorkspaceFolders`` — a **broken-set** of pairs that failed
 to spawn/initialize (retried only after ``lsp.broken_retry_seconds``; never, by default), and a **delta baseline**
 per file (``snapshot_baseline()`` runs BEFORE a write; the next ``get_diagnostics_sync()``
-returns only diagnostics not in it).  Off unless config enables it.
+returns only diagnostics not in it).  Off unless config enables it.  :meth:`LSPService.request_sync`
+is the plugin-facing read path: one ``READ_ONLY_METHODS`` request, behind the same gates.
 """
 from __future__ import annotations
 
@@ -18,11 +19,13 @@ import math
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
-from agent.lsp.client import DIAGNOSTICS_DOCUMENT_WAIT, LSPClient, _diagnostic_key as _diag_key
+from agent.lsp.client import DIAGNOSTICS_DOCUMENT_WAIT, LSPClient, _diagnostic_key as _diag_key, file_uri
 from agent.lsp.edit_check import EditChecks
+from agent.lsp.protocol import LSPProtocolError
 from agent.lsp.servers import (
     SERVERS, UNTRUSTED_SAFE_SERVERS, ServerContext, ServerDef, custom_servers, find_server_for_file, language_id_for,
 )
@@ -36,6 +39,26 @@ MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait bu
 
 _Key = tuple[str, str]
 _Diags = list[dict[str, Any]]
+
+# What :meth:`LSPService.request_sync` may send: requests that read the project and change nothing.
+READ_ONLY_METHODS = frozenset({
+    "textDocument/hover", "textDocument/definition", "textDocument/declaration", "textDocument/typeDefinition",
+    "textDocument/implementation", "textDocument/references", "textDocument/documentSymbol",
+    "textDocument/documentHighlight", "workspace/symbol",
+})
+
+
+class LSPUnavailable(Exception):
+    """No language server can answer for this file.  ``reason`` says why."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def require_read_only(method: str) -> None:
+    if method not in READ_ONLY_METHODS:
+        raise ValueError(f"{method!r} is not a read-only LSP method; use one of {', '.join(sorted(READ_ONLY_METHODS))}")
 
 
 def _float_or(value: Any, default: float) -> float:
@@ -263,22 +286,31 @@ class LSPService:
     def enabled_for(self, file_path: str) -> bool:
         """True iff LSP should run for this file: registered non-disabled server, git workspace,
         and pair not broken (a failed server costs nothing until ``hermes lsp restart`` / exit)."""
-        srv = self._server_for(file_path) if self._enabled else None
-        if srv is None or srv.server_id in self._disabled_servers:
-            return False
-        key = self._broken_key(srv, file_path)
-        if key is None:
-            return False
+        return self._unavailable_reason(file_path) is None
+
+    def _unavailable_reason(self, file_path: str) -> Optional[str]:
+        """Why LSP does not run for this file (the gates of :meth:`enabled_for`), or None when it does."""
+        if not self._enabled:
+            return "LSP is disabled (lsp.enabled is false in config.yaml)"
+        if (srv := self._server_for(file_path)) is None:
+            return f"no language server handles {os.path.basename(file_path)}"
+        if srv.server_id in self._disabled_servers:
+            return f"the {srv.server_id} server is disabled (lsp.servers.{srv.server_id}.disabled in config.yaml)"
+        if (key := self._broken_key(srv, file_path)) is None:
+            return f"{file_path} is not inside a git workspace"
         if self._root_excluded(key[1]):
             eventlog.log_root_excluded(srv.server_id, key[1], file_path, invalid=self._exclude_roots is None)
-            return False
+            if self._exclude_roots is None:
+                return "lsp.exclude_roots is not a list of glob patterns, so every workspace is skipped"
+            return f"workspace {key[1]} matches lsp.exclude_roots"
         self._note_operator_roots()
         if self._untrusted_denied(srv, key[1], file_path, self._trusted(key[1])):
-            return False
+            return f"workspace {key[1]} is not trusted for {srv.server_id} (add it to lsp.trusted_workspaces)"
         if self._is_broken(key):
             eventlog.log_skipped_broken(srv.server_id, key[1], file_path, retry_in=self._broken_retry_in(key))
-            return False
-        return True
+            return (f"the {srv.server_id} server for {key[1]} is marked broken after an earlier failure "
+                    "(run `hermes lsp restart`)")
+        return None
 
     def _note_operator_roots(self) -> None:
         """Remember this thread's ``operator_workspace_roots``.  Called where a tool thread enters (it sees
@@ -425,6 +457,67 @@ class LSPService:
         else:
             eventlog.log_clean(server_id, file_path)
         return diags
+
+    def request_sync(
+        self, file_path: str, method: str, params: Optional[dict[str, Any]] = None,
+        *, timeout: Optional[float] = None,
+    ) -> Any:
+        """Open ``file_path`` on its server, send ``method``, return the raw LSP result.
+
+        ``method`` must be in ``READ_ONLY_METHODS`` (else ``ValueError``); a ``textDocument/`` request
+        without ``params["textDocument"]`` gets this file's.  ``None`` = the server has no answer.
+        Raises :class:`LSPUnavailable` when no server can answer (the gates of :meth:`enabled_for`,
+        a failed spawn, no answer within ``timeout``, default ``lsp.wait_timeout``) and
+        ``LSPRequestError`` when the server answers with an error.  A connection failure marks the
+        server broken, as :meth:`get_diagnostics_sync` does.  An unreadable file raises ``OSError``.
+        """
+        require_read_only(method)
+        if timeout is not None and not timeout > 0:
+            raise ValueError(f"timeout must be a positive number of seconds, got {timeout!r}")
+        if (reason := self._unavailable_reason(file_path)) is not None:
+            raise LSPUnavailable(reason)
+        abs_path = os.path.abspath(file_path)
+        text = Path(abs_path).read_text(encoding="utf-8-sig", errors="replace")
+        params = dict(params or {})
+        if method.startswith("textDocument/") and "textDocument" not in params:
+            params["textDocument"] = {"uri": file_uri(abs_path)}
+        server_id = self._server_for(abs_path).server_id  # the gates guarantee a match
+        default = self._wait_budget(abs_path)
+        budget = timeout if timeout is not None else default
+        # A ceiling only: it adds the spawn/warm-up allowance diagnostics get, so a short ``timeout``
+        # on a cold root cannot mark a slow-starting server broken.
+        ceiling = budget + default + 2.0
+        try:
+            return self._loop.run(self._request_async(abs_path, text, method, params, budget), timeout=ceiling)
+        except TimeoutError as e:
+            eventlog.log_timeout(server_id, abs_path, kind=method)
+            self._mark_broken_for_file(abs_path, e)
+            raise LSPUnavailable(f"the {server_id} server did not start or answer within {ceiling:g}s") from e
+        except (LSPProtocolError, RuntimeError) as e:
+            eventlog.log_server_error(server_id, abs_path, e)
+            self._mark_broken_for_file(abs_path, e)
+            raise LSPUnavailable(f"the {server_id} server failed: {e}") from e
+
+    async def _request_async(self, abs_path: str, text: str, method: str, params: dict[str, Any],
+                             budget: float) -> Any:
+        if (client := await self._get_or_spawn(abs_path)) is None:
+            raise LSPUnavailable(f"the {self._server_for(abs_path).server_id} server could not start for "
+                                 f"{abs_path} (see `hermes lsp status`)")
+        synced = client.document_text(abs_path)
+        # An edit check diagnoses its own snapshots of the file; a re-sync now would answer its wait
+        # with the verdict on this text.  It leaves the server holding the newest content when done.
+        checking = (tail := self._edit_checks.tail.get(abs_path)) is not None and not tail.task.done()
+        try:
+            if synced is None or (synced != text and not checking):
+                await client.open_file(abs_path, language_id=language_id_for(abs_path, self._server_for(abs_path)),
+                                       text=text)
+            return await client._send_request_with_retry(method, params, timeout=budget)
+        except TimeoutError as e:
+            # Alive but slow (a cold project still indexing): not marked broken.
+            raise LSPUnavailable(f"the {client.server_id} server did not answer {method} within {budget:g}s "
+                                 "(pass a longer timeout or raise lsp.wait_timeout)") from e
+        finally:
+            self._touch(client)
 
     def _apply_delta(self, file_path: str, diags: _Diags, line_shift: Optional[Callable[[int], Optional[int]]]) -> _Diags:
         """Drop diagnostics present in the pre-write baseline, then roll the baseline forward."""
@@ -769,4 +862,4 @@ class LSPService:
         await asyncio.gather(*(c.shutdown() for c in clients), return_exceptions=True)
 
 
-__all__ = ["LSPService"]
+__all__ = ["READ_ONLY_METHODS", "LSPService", "LSPUnavailable"]

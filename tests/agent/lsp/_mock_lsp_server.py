@@ -47,6 +47,10 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   ``$/cancelRequest`` it appends the cancelled id to the file named by
   ``MOCK_LSP_TRACE`` and only then answers that id with a result carrying a
   ``late`` marker: a server that finishes work the client already abandoned.
+- ``"query"`` — clean diagnostics; answers every other request with an echo of it plus its copy
+  of the document (``text``) and the URIs it has open (``open``).  ``params.mock`` picks a failure
+  instead: ``"null"`` (null result), ``"error"`` (an error response), ``"hang"`` (no answer) or
+  ``"exit"`` (the process exits).
 
 The script writes JSON-RPC framed messages to stdout and reads from
 stdin.  No third-party dependencies — uses only stdlib so it runs
@@ -95,7 +99,7 @@ _PUSH_HANDLERS = {"by_content": _push_by_content, "slow_push": _push_slow}
 _IGNORED_NOTIFICATIONS = {"initialized", "workspace/didChangeConfiguration", "workspace/didChangeWatchedFiles"}
 
 
-def _late_pull(msg: dict) -> bool:
+def _late_pull(msg: dict, documents: dict) -> bool:
     """``late_pull``: hold diagnostic pulls and ``shutdown``; answer one only after the client cancels it."""
     if msg.get("method") in {"textDocument/diagnostic", "shutdown"}:
         return True
@@ -106,6 +110,29 @@ def _late_pull(msg: dict) -> bool:
         fh.write(f"{cancelled}\n")
     write_message({"jsonrpc": "2.0", "id": cancelled, "result": {"kind": "full", "items": [{"late": True}]}})
     return True
+
+
+def _query(msg: dict, documents: dict) -> bool:
+    """``query``: echo every request but the lifecycle and pull ones, with the server's document mirror."""
+    if "id" not in msg or msg.get("method") in {"shutdown", "textDocument/diagnostic"}:
+        return False
+    params = msg.get("params") or {}
+    mock = params.get("mock")
+    if mock == "hang":
+        return True
+    if mock == "exit":
+        sys.exit(0)
+    if mock == "error":
+        write_message({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32602, "message": "mock rejects this"}})
+        return True
+    uri = (params.get("textDocument") or {}).get("uri")
+    result = None if mock == "null" else {"method": msg["method"], "params": params, "text": documents.get(uri),
+                                          "open": sorted(documents)}
+    write_message({"jsonrpc": "2.0", "id": msg["id"], "result": result})
+    return True
+
+
+_REQUEST_HANDLERS = {"late_pull": _late_pull, "query": _query}
 
 
 def read_message():
@@ -224,7 +251,7 @@ def main():
             uri = td.get("uri", "")
             version = td.get("version", 0)
             is_change = msg.get("method") == "textDocument/didChange"
-            if script == "incremental":
+            if script in {"incremental", "query"}:
                 text = documents.get(uri, "") if is_change else td["text"]
                 for change in params.get("contentChanges", []):
                     if "range" not in change:
@@ -301,7 +328,7 @@ def main():
             }})
             continue
 
-        if script == "late_pull" and _late_pull(msg):
+        if script in _REQUEST_HANDLERS and _REQUEST_HANDLERS[script](msg, documents):
             continue
 
         if msg.get("method") == "textDocument/diagnostic":

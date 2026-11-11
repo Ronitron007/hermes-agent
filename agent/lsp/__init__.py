@@ -5,15 +5,16 @@ Real language servers (pyright, gopls, ...) run as subprocesses and their
 ``patch`` (wiring: ``FileOperations._check_lint_delta``).  LSP is **gated on git
 workspace detection** so user-home cwd's (e.g. Telegram gateway chats) never
 spawn daemons; ``get_service()`` returns the singleton or ``None`` when disabled.
+Plugins read code intelligence through :func:`request` (hover, definition, references, ...).
 """
 from __future__ import annotations
 
 import atexit
 import logging
 import threading
-from typing import Optional
+from typing import Any, Optional
 
-from agent.lsp.manager import LSPService
+from agent.lsp.manager import LSPService, LSPUnavailable, require_read_only
 
 logger = logging.getLogger("agent.lsp")
 
@@ -64,6 +65,17 @@ def get_service() -> Optional[LSPService]:
     return _active(_service)
 
 
+def request(file_path: str, method: str, params: Optional[dict[str, Any]] = None,
+            *, timeout: Optional[float] = None) -> Any:
+    """Send the read-only LSP request ``method`` for ``file_path`` to the active profile's server and
+    return its raw result; ``None`` = the server has no answer.  Blocks up to ``timeout`` (default
+    ``lsp.wait_timeout``).  See :meth:`LSPService.request_sync` for the params and errors."""
+    require_read_only(method)
+    if (svc := get_service()) is None:
+        raise LSPUnavailable("LSP is disabled (lsp.enabled is false in config.yaml, or the config did not load)")
+    return svc.request_sync(file_path, method, params, timeout=timeout)
+
+
 def release_workspace(path: str) -> int:
     """Shut down the LSP clients serving ``path`` (a worktree about to be removed) in every started
     service, without shutting down unrelated workspaces.  Never creates a service.  Returns the count."""
@@ -101,4 +113,4 @@ def _atexit_shutdown() -> None:
         logger.debug("atexit LSP shutdown failed: %s", e)
 
 
-__all__ = ["LSPService", "get_service", "release_workspace", "shutdown_service"]
+__all__ = ["LSPService", "LSPUnavailable", "get_service", "release_workspace", "request", "shutdown_service"]
